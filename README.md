@@ -1,5 +1,7 @@
 # MM-GBSA Suite
 
+![easy_mmgbsa Infographic](easy_mmgbsa_ Validated MM-GBSA Suite.png)
+
 A collection of validated MM-GBSA implementations for computing protein–ligand binding free energies using the Generalized Born (GB) solvation model. All scripts are single-trajectory (bonded terms cancel exactly).
 
 ---
