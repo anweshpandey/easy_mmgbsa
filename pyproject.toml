@@ -49,5 +49,5 @@ mmgbsa = "mmgbsa:main"
 mmgbsa-docking = "mmgbsa_docking:main"
 
 [tool.setuptools.py-modules]
-find = {}
 namespaces = false
+modules = ["mmgbsa", "mmgbsa_amb", "mmgbsa_gmx", "mmgbsa_docking"]
