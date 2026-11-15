@@ -374,7 +374,7 @@ class LigandParameterizer:
             path = Path(f)
             if path.is_dir():
                 # Find all supported ligand files in directory
-                for ext in (".sdf", ".mol2", ".pdb", ".mol", ".mae"):
+                for ext in (".sdf", ".mol2", ".pdb", ".mol", ".mae", ".pdbqt"):
                     expanded.extend(sorted(path.glob(f"*{ext}")))
             else:
                 # Handle glob patterns
@@ -419,6 +419,12 @@ class LigandParameterizer:
             molecules = list(Molecule.from_file(lig_file, file_format="pdb"))
         elif ext in (".mol",):
             molecules = list(Molecule.from_file(lig_file, file_format="mol"))
+        elif ext == ".pdbqt":
+            # PDBQT: AutoDock Vina output format (PDB with charges/atom types in extra columns)
+            # Use RDKit to read, then convert to OpenFF Molecule
+            if not _HAVE_RDKIT:
+                raise RuntimeError("RDKit required to read PDBQT files. Install with: pip install rdkit")
+            molecules = self._read_pdbqt_with_rdkit(lig_file, name)
         else:
             raise ValueError(f"Unsupported ligand format: {ext}")
         
@@ -535,6 +541,8 @@ class LigandParameterizer:
             mol = next((m for m in mols if m is not None), None)
         elif ext == ".pdb":
             mol = Chem.MolFromPDBFile(input_file, removeHs=False)
+        elif ext == ".pdbqt":
+            mol = Chem.MolFromPDBFile(input_file, removeHs=False)  # RDKit reads PDBQT as PDB
         elif ext == ".mol":
             mol = Chem.MolFromMolFile(input_file, removeHs=False)
         else:
@@ -559,6 +567,30 @@ class LigandParameterizer:
         except Exception:
             # Just rename
             shutil.move(output_file.replace(".mol2", ".sdf"), output_file)
+    
+    def _read_pdbqt_with_rdkit(self, pdbqt_file: str, name: str) -> List:
+        """Read PDBQT file using RDKit and convert to OpenFF Molecule(s)."""
+        # RDKit can read PDBQT as PDB (ignores the extra columns)
+        mol = Chem.MolFromPDBFile(pdbqt_file, removeHs=False, sanitize=True)
+        if mol is None:
+            raise ValueError(f"Failed to read PDBQT file: {pdbqt_file}")
+        
+        # Remove any existing hydrogens (PDBQT usually has polar H only)
+        mol = Chem.RemoveHs(mol)
+        
+        # Add all hydrogens with proper geometry
+        mol = Chem.AddHs(mol, addCoords=True)
+        
+        # Generate 3D coordinates if not present or optimize
+        if mol.GetNumConformers() == 0:
+            AllChem.EmbedMolecule(mol, randomSeed=42)
+        AllChem.MMFFOptimizeMolecule(mol)
+        
+        # Convert RDKit mol to OpenFF Molecule
+        off_mol = Molecule.from_rdkit(mol, allow_undefined_stereo=True)
+        off_mol.name = name
+        
+        return [off_mol]
 
 
 # ============================================================================
@@ -1044,7 +1076,7 @@ def parse_args() -> DockingConfig:
     # Input
     p.add_argument("-p", "--protein", required=True, help="Protein PDB file")
     p.add_argument("-l", "--ligands", nargs="+", required=True, 
-                   help="Ligand file(s): SDF, MOL2, PDB, or directory")
+                   help="Ligand file(s): SDF, MOL2, PDB, PDBQT (AutoDock Vina), or directory")
     p.add_argument("--ligand-resname", default="LIG", help="Ligand residue name")
     p.add_argument("--prepared-ligand", action="store_true",
                    help="Ligand files already parameterized (MOL2 with charges/types)")

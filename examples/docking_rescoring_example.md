@@ -16,9 +16,21 @@ pip install "easy-mmgbsa[docking]"
 
 You need:
 1. **Protein PDB** - A protein structure file (can be from PDB, homology model, etc.)
-2. **Ligand files** - One or more ligand files in SDF, MOL2, or PDB format (from docking)
+2. **Ligand files** - One or more ligand files in SDF, MOL2, PDB, **PDBQT (AutoDock Vina)**, or directory format
 
-### Example Directory Structure
+### Example Directory Structure (AutoDock Vina output)
+```
+project/
+├── protein.pdb              # Protein structure
+├── vina_output/             # AutoDock Vina output directory
+│   ├── ligand_1_out.pdbqt   # Docked poses (PDBQT format)
+│   ├── ligand_2_out.pdbqt
+│   ├── ligand_3_out.pdbqt
+│   └── ...
+└── run_rescoring.sh         # Script to run rescoring
+```
+
+### Example Directory Structure (SDF/MOL2)
 ```
 project/
 ├── protein.pdb          # Protein structure
@@ -67,6 +79,17 @@ mmgbsa-docking -p protein.pdb -l ligand.mol2 \
 ```bash
 mmgbsa-docking -p protein.pdb -l ligands/ \
     --max-ligands 10 --keep-intermediate -v -o test_results.csv
+```
+
+### AutoDock Vina PDBQT Output (Direct Rescoring)
+```bash
+# AutoDock Vina produces PDBQT files - rescore them directly!
+mmgbsa-docking -p protein.pdb -l vina_output/*.pdbqt \
+    -o vina_mmgbsa_results.csv --decomp vina_decomp.csv --json vina_summary.json
+
+# Or process entire Vina output directory
+mmgbsa-docking -p protein.pdb -l vina_output/ \
+    -o vina_mmgbsa_results.csv --decomp vina_decomp.csv
 ```
 
 ## Output Files

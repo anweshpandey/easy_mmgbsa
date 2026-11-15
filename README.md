@@ -74,6 +74,14 @@ python3 mmgbsa_docking.py -p protein.pdb -l ligands.sdf \
 python3 mmgbsa_docking.py -p protein.pdb -l ligand.mol2 \
     --prepared-ligand -o results.csv
 
+# **AutoDock Vina PDBQT output** — rescore Vina poses directly!
+python3 mmgbsa_docking.py -p protein.pdb -l vina_output/*.pdbqt \
+    -o vina_mmgbsa_results.csv --decomp vina_decomp.csv --json vina_summary.json
+
+# Or process entire Vina output directory
+python3 mmgbsa_docking.py -p protein.pdb -l vina_output/ \
+    -o vina_mmgbsa_results.csv --decomp vina_decomp.csv
+
 # Limit for testing, keep intermediate files
 python3 mmgbsa_docking.py -p protein.pdb -l ligands.sdf \
     --max-ligands 10 --keep-intermediate -v
