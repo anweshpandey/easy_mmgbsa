@@ -19,7 +19,7 @@ from pathlib import Path
 
 # Import the validated v4 engine
 sys.path.insert(0, os.path.dirname(__file__))
-import mmgbsa_amber_v4 as v4
+import mmgbsa_amb as v4
 import parmed as pmd
 
 # ============================================================================

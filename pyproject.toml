@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "easy-mmgbsa"
-version = "0.1.0"
-description = "Validated MM-GBSA implementations for protein–ligand binding free energies"
+version = "0.2.0"
+description = "Validated MM-GBSA implementations for protein–ligand binding free energies, including docking rescoring"
 readme = "README.md"
 license = {text = "MIT"}
 authors = [
@@ -30,15 +30,23 @@ dependencies = [
     "scipy>=1.7",
     "parmed>=4.0",
 ]
-optional-dependencies = {
-    "xtc": ["mdanalysis>=2.0"],
-    "dev": ["pytest", "black", "ruff"],
-}
+[project.optional-dependencies]
+xtc = ["mdanalysis>=2.0"]
+docking = [
+    "openff-toolkit>=0.14",
+    "openff-recharge>=0.3",
+    "openff-interchange>=0.5",
+    "pdbfixer>=1.9",
+    "propka3>=3.4",
+    "rdkit>=2023.03",
+]
+dev = ["pytest", "black", "ruff"]
 
 [project.scripts]
 mmgbsa-amb = "mmgbsa_amb:main"
 mmgbsa-gmx = "mmgbsa_gmx:main"
 mmgbsa = "mmgbsa:main"
+mmgbsa-docking = "mmgbsa_docking:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

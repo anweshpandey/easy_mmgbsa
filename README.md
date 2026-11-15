@@ -13,6 +13,9 @@ A collection of validated MM-GBSA implementations for computing protein–ligand
 | **`mmgbsa_amb.py`** | **Main implementation** — AMBER & GROMACS topologies, validated against MMPBSA.py, full feature set | Fast (vectorized) | NumPy, SciPy, ParmEd |
 | **`mmgbsa_gmx.py`** | GROMACS-oriented wrapper using `mmgbsa_amb.py` engine | Fast | Same as above |
 | **`mmgbsa.py`** | Lightweight standalone for GROMACS `topol.top` + `lig.itp` workflows | Slower (Python loops) | NumPy, SciPy, ParmEd |
+| **`mmgbsa_docking.py`** | **Physics-based docking rescoring** — prepares MM parameters for docked poses, runs MM-GBSA | Batch | + OpenFF, PDBFixer, PROPKA |
+
+> **New in v0.2**: `mmgbsa_docking.py` provides a complete physics-based rescoring engine for molecular docking / virtual screening workflows. It handles the critical topology/parameter preparation that docked poses require before MM-GBSA calculation.
 
 ---
 
@@ -48,6 +51,45 @@ python3 mmgbsa_gmx.py -p topol.top -l lig.itp -c frame_*.gro \
 python3 mmgbsa.py -p topol.top -l lig.itp -c frame_*.gro \
     -o results.csv --decomp decomp.csv
 ```
+
+### 4. **Docking Rescoring (NEW)** — use `mmgbsa_docking.py`
+
+```bash
+# Install docking dependencies first:
+# pip install "easy-mmgbsa[docking]"
+
+# Basic: protein PDB + ligand SDF/MOL2/PDB files (or directory)
+python3 mmgbsa_docking.py -p protein.pdb -l ligands.sdf -o results.csv
+
+# With decomposition and JSON summary
+python3 mmgbsa_docking.py -p protein.pdb -l poses/ \
+    --decomp decomp.csv --json summary.json
+
+# Custom force fields and charge method
+python3 mmgbsa_docking.py -p protein.pdb -l ligands.sdf \
+    --protein-ff ff19SB --ligand-ff gaff-2.11 --charge-method am1bcc \
+    --ph 7.4 -o results.csv --decomp decomp.csv
+
+# Pre-parameterized ligands (MOL2 with GAFF/AM1-BCC charges from antechamber)
+python3 mmgbsa_docking.py -p protein.pdb -l ligand.mol2 \
+    --prepared-ligand -o results.csv
+
+# Limit for testing, keep intermediate files
+python3 mmgbsa_docking.py -p protein.pdb -l ligands.sdf \
+    --max-ligands 10 --keep-intermediate -v
+```
+
+**Key point**: Docked poses from docking programs (AutoDock Vina, Glide, GOLD, DOCK, etc.) are **not** ready for MM-GBSA. They lack:
+- Proper atom types and charges for the force field
+- Protein protonation states at the target pH
+- Complete hydrogen atoms
+- Consistent topology between protein and ligand
+
+`mmgbsa_docking.py` handles all of this automatically using:
+- **Protein**: AMBER ff14SB/ff19SB via `tleap` (or OpenFF fallback)
+- **Ligand**: GAFF2 + AM1-BCC charges via OpenFF toolkit (or antechamber fallback)
+- **Protonation**: PROPKA for protein, proper tautomers for ligand
+- **Structure fixing**: PDBFixer for missing atoms/residues
 
 ---
 
@@ -144,6 +186,86 @@ python3 mmgbsa.py -p topol.top -l lig.itp -c frame_*.gro \
 **GROMACS round-trip** (`rasraf.top` + `rasraf.gro`): ΔTOTAL = -90.958 (topology conversion diff only)
 
 **Decomposition**: per-residue VDW/Coulomb match to 0.001 kcal/mol (mdout rounding); GB offset due to MMPBSA.py using `extdiel=80` vs 78.3
+
+---
+
+## Docking Rescoring Workflow (`mmgbsa_docking.py`)
+
+### The Problem: Docked Poses ≠ MM-GBSA Ready
+
+Docking programs output poses with arbitrary atom naming, no partial charges, no force field atom types, and often missing hydrogens. **Running MM-GBSA directly on docked PDBs gives meaningless results.**
+
+### The Solution: Physics-Based Preparation Pipeline
+
+`mmgbsa_docking.py` implements a complete preparation pipeline:
+
+```
+Docked PDB/SDF/MOL2
+        │
+        ▼
+┌───────────────────┐
+│  Ligand           │
+│  Parameterization │──► GAFF2 atom types + AM1-BCC charges (OpenFF/antechamber)
+└───────────────────┘
+        │
+        ▼
+┌───────────────────┐
+│  Protein          │
+│  Preparation      │──► Fix structure (PDBFixer), protonate (PROPKA), add H, assign FF
+└───────────────────┘
+        │
+        ▼
+┌───────────────────┐
+│  Complex Assembly │──► Merge protein + ligand into single AMBER topology
+└───────────────────┘
+        │
+        ▼
+┌───────────────────┐
+│  MM-GBSA Engine   │──► Validated OBC GB + SASA (mmgbsa_amb.py v4)
+└───────────────────┘
+        │
+        ▼
+   Ranked ΔGbind
+```
+
+### Ligand Parameterization Details
+
+| Method | Description | Requirements |
+|--------|-------------|--------------|
+| **AM1-BCC** (default) | Semi-empirical QM charges, bond-charge corrections | OpenFF Recharge (OpenEye) or antechamber |
+| **AM1-BCCELF10** | AM1-BCC with ELF10 conformational sampling | OpenFF Recharge |
+| **Gasteiger** | Fast empirical PEOE charges | RDKit (no QM) |
+| **MMFF94** | Merck Molecular Force Field charges | RDKit |
+
+**Recommended**: `am1bcc` with OpenFF Recharge (most accurate, used in SAMPL challenges).
+
+### Protein Preparation Details
+
+| Step | Tool | Purpose |
+|------|------|---------|
+| Structure fixing | PDBFixer | Add missing atoms, residues, loops |
+| Protonation states | PROPKA | Assign His/Cys/Asp/Glu states at target pH |
+| Hydrogen addition | PDBFixer/tleap | Add all H atoms with correct geometry |
+| Force field | tleap (AMBER) | Assign ff14SB/ff19SB parameters |
+
+### Output Files (Docking Rescoring)
+
+| File | Description |
+|------|-------------|
+| `results.csv` | Ranked ligands: `rank`, `ligand`, `delta_total`, `delta_vdw`, `delta_elec`, `delta_gb`, `delta_sasa` + absolute components |
+| `decomp.csv` | Per-residue decomposition for all ligands (merged, with `ligand` and `rank` columns) |
+| `summary.json` | Machine-readable: config, all results, statistics (best, mean, std) |
+
+---
+
+## Docking Rescoring Example
+
+See [`examples/docking_rescoring_example.md`](examples/docking_rescoring_example.md) for a complete walkthrough with:
+- Installation instructions
+- Input file preparation
+- Command-line options explained
+- Output file formats
+- Troubleshooting common issues
 
 ---
 
