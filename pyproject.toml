@@ -48,6 +48,6 @@ mmgbsa-gmx = "mmgbsa_gmx:main"
 mmgbsa = "mmgbsa:main"
 mmgbsa-docking = "mmgbsa_docking:main"
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["*"]
+[tool.setuptools.py-modules]
+namespaces = false
+modules = ["mmgbsa", "mmgbsa_amb", "mmgbsa_gmx", "mmgbsa_docking"]
