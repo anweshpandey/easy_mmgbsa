@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "easy-mmgbsa"
+version = "0.1.0"
+description = "Validated MM-GBSA implementations for protein–ligand binding free energies"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "Anwesh Pandey", email = "apandey@github.com"}
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Topic :: Scientific/Engineering :: Chemistry",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.21",
+    "scipy>=1.7",
+    "parmed>=4.0",
+]
+optional-dependencies = {
+    "xtc": ["mdanalysis>=2.0"],
+    "dev": ["pytest", "black", "ruff"],
+}
+
+[project.scripts]
+mmgbsa-amb = "mmgbsa_amb:main"
+mmgbsa-gmx = "mmgbsa_gmx:main"
+mmgbsa = "mmgbsa:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["*"]
+
+[tool.setuptools.package-dir]
+"" = "."
