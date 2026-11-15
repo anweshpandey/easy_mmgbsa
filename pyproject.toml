@@ -43,10 +43,11 @@ docking = [
 dev = ["pytest", "black", "ruff"]
 
 [project.scripts]
-mmgbsa-amb = "mmgbsa_amb:main"
-mmgbsa-gmx = "mmgbsa_gmx:main"
-mmgbsa = "mmgbsa:main"
-mmgbsa-docking = "mmgbsa_docking:main"
+mmgbsa-amb = "easy_mmgbsa.mmgbsa_amb:main"
+mmgbsa-gmx = "easy_mmgbsa.mmgbsa_gmx:main"
+mmgbsa = "easy_mmgbsa.mmgbsa:main"
+mmgbsa-docking = "easy_mmgbsa.mmgbsa_docking:main"
 
-[tool.setuptools]
-py-modules = ["mmgbsa", "mmgbsa_amb", "mmgbsa_gmx", "mmgbsa_docking"]
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["easy_mmgbsa*"]
