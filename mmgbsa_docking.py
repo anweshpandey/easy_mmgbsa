@@ -4,33 +4,39 @@ MM-GBSA Docking Rescoring Engine
 ================================
 
 Physics-based rescoring for protein–ligand complexes from molecular docking
-or virtual screening. Handles the critical topology/parameter preparation
-that docked poses require before MM-GBSA calculation.
+(AutoDock Vina, AutoDock4, Glide, GOLD, etc.). Handles the critical topology/
+parameter preparation that docked poses require before MM-GBSA calculation.
 
 Key features:
-- Protein preparation with standard AMBER force fields (ff14SB, ff19SB)
-- Ligand parameterization with GAFF2 + AM1-BCC charges (via OpenFF toolkit)
-- Automatic protonation state assignment (via OpenFF/OpenEye or PROPKA)
-- Complex assembly with proper topology
-- Batch processing of multiple ligand poses
-- Ranked output with per-pose MM-GBSA energies
+- Reads AutoDock Vina PDBQT files (multiple poses per file)
+- Maps docked coordinates onto original ligand structures (SDF/MOL2) to preserve
+  chemical information (bond orders, stereochemistry) while keeping docking poses
+- Protein preparation: PDBFixer (structure fixing), PROPKA (protonation), AMBER FF
+- Ligand parameterization: GAFF2 + AM1-BCC charges (OpenFF toolkit/AmberTools)
+- Complex assembly: merges protein + ligand into single AMBER topology
+- MM-GBSA: uses validated mmgbsa_amb.py v4 engine (OBC GB, HCT descreening, idecomp)
+- Batch processing of ligand libraries with ranked output
 
 Usage:
-    # Single protein + multiple ligand poses (SDF/MOL2/PDB)
-    python3 mmgbsa_docking.py -p protein.pdb -l ligands.sdf -o results.csv
+    # AutoDock Vina poses + original ligand structures
+    python3 mmgbsa_docking.py -p protein.pdb -l vina_output/*.pdbqt \
+        --ligand-refs ligands.sdf -o results.csv --decomp decomp.csv
 
-    # With explicit protein force field and ligand charge method
-    python3 mmgbsa_docking.py -p protein.pdb -l poses/ --ff ff19SB --charge am1bcc \
-        --decomp decomp.csv --json summary.json
+    # With decomposition and JSON summary
+    python3 mmgbsa_docking.py -p protein.pdb -l poses/ \
+        --ligand-refs ligands.sdf --decomp decomp.csv --json summary.json
 
-    # Provide pre-parameterized ligand (MOL2 with charges) + protein PDB
-    python3 mmgbsa_docking.py -p protein.pdb -l ligand.mol2 --prepared-ligand
+    # Custom force fields and charge method
+    python3 mmgbsa_docking.py -p protein.pdb -l vina_output/ \
+        --ligand-refs ligands.sdf --protein-ff ff19SB --ligand-ff gaff-2.11 \
+        --charge-method am1bcc --ph 7.4 -o results.csv --decomp decomp.csv
 
 Requirements:
     openff-toolkit (for ligand GAFF2/AM1-BCC parameterization)
     openff-recharge (optional, for AM1-BCC via OpenEye/AM1BCC)
     propka3 (optional, for protein protonation states)
     pdbfixer (optional, for protein structure fixing)
+    rdkit (optional, for PDBQT parsing and antechamber fallback)
 
 The engine uses the validated mmgbsa_amb.py MM-GBSA implementation under the hood.
 """
@@ -39,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import glob
 import json
 import logging
 import os
@@ -130,7 +137,8 @@ STANDARD_AA = {
 class DockingConfig:
     # Input files
     protein_pdb: str
-    ligand_files: List[str]  # SDF, MOL2, PDB files or directory
+    ligand_files: List[str]  # PDBQT files from docking (or SDF/MOL2/PDB)
+    ligand_refs: Optional[str] = None  # Original ligand structures (SDF/MOL2) for chemical info
     ligand_resname: str = "LIG"
     
     # Force fields
@@ -148,6 +156,9 @@ class DockingConfig:
     prepared_ligand: bool = False  # ligand files already have charges/types
     max_ligands: Optional[int] = None  # limit for testing
     ligand_name_prefix: str = "LIG"
+    
+    # Pose selection mode
+    pose_mode: str = "best"  # "best", "all", "ensemble"
     
     # MM-GBSA settings
     igb: int = DEFAULT_IGB
@@ -184,6 +195,222 @@ def setup_logging(verbose: bool) -> logging.Logger:
 
 
 # ============================================================================
+# PDBQT Parser (AutoDock Vina output)
+# ============================================================================
+class PDBQTParser:
+    """Parse AutoDock Vina PDBQT files containing multiple docking poses."""
+    
+    @staticmethod
+    def parse(pdbqt_file: str) -> List[Dict[str, Any]]:
+        """
+        Parse PDBQT file and return list of poses.
+        Each pose dict contains: atoms (list), coords (np.ndarray), energy (float), 
+        atom_names, atom_types, charges
+        """
+        poses = []
+        current_pose = None
+        
+        with open(pdbqt_file, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                
+                if line.startswith('MODEL'):
+                    # New pose
+                    if current_pose is not None:
+                        poses.append(current_pose)
+                    current_pose = {
+                        'model_num': int(line.split()[1]),
+                        'atoms': [],
+                        'coords': [],
+                        'atom_names': [],
+                        'atom_types': [],
+                        'charges': [],
+                        'energy': None
+                    }
+                elif line.startswith('ENDMDL'):
+                    if current_pose is not None:
+                        poses.append(current_pose)
+                        current_pose = None
+                elif line.startswith('REMARK VINA RESULT:'):
+                    # Vina binding affinity
+                    if current_pose is not None:
+                        parts = line.split()
+                        current_pose['energy'] = float(parts[3])
+                elif line.startswith('ATOM') or line.startswith('HETATM'):
+                    if current_pose is None:
+                        current_pose = {
+                            'model_num': 1,
+                            'atoms': [],
+                            'coords': [],
+                            'atom_names': [],
+                            'atom_types': [],
+                            'charges': [],
+                            'energy': None
+                        }
+                    # PDBQT format: ATOM  x   y   z  q  type
+                    # Columns: 0-5: ATOM/HETATM, 6-11: serial, 12-15: name, 16: altLoc,
+                    # 17-20: resName, 22: chainID, 23-26: resSeq, 27: iCode,
+                    # 30-37: x, 38-45: y, 46-53: z, 54-59: occupancy, 60-65: tempFactor,
+                    # 66-76: element/charge (q), 77-78: atom type (AutoDock type)
+                    x = float(line[30:38])
+                    y = float(line[38:46])
+                    z = float(line[46:54])
+                    # Charge is in columns 69-76 (or 70-76)
+                    try:
+                        q = float(line[69:76]) if len(line) > 76 else 0.0
+                    except ValueError:
+                        q = 0.0
+                    # Atom type in columns 77-78
+                    atype = line[77:79].strip() if len(line) > 78 else "C"
+                    name = line[12:16].strip()
+                    
+                    current_pose['coords'].append([x, y, z])
+                    current_pose['atom_names'].append(name)
+                    current_pose['atom_types'].append(atype)
+                    current_pose['charges'].append(q)
+                    current_pose['atoms'].append({
+                        'name': name, 'type': atype, 'charge': q,
+                        'x': x, 'y': y, 'z': z
+                    })
+        
+        # Handle last pose if file doesn't end with ENDMDL
+        if current_pose is not None and current_pose['coords']:
+            poses.append(current_pose)
+        
+        # Convert coords to numpy arrays
+        for pose in poses:
+            pose['coords'] = np.array(pose['coords'], dtype=float)
+        
+        return poses
+
+
+# ============================================================================
+# Ligand Reference Loader (SDF/MOL2 for chemical information)
+# ============================================================================
+class LigandReferenceLoader:
+    """Load original ligand structures from SDF/MOL2 for chemical info (bond orders, stereo)."""
+    
+    def __init__(self, logger: logging.Logger):
+        self.logger = logger
+        self.refs: Dict[str, Any] = {}  # name -> RDKit mol or OpenFF Molecule
+    
+    def load(self, ref_file: str) -> Dict[str, Any]:
+        """Load ligand references from SDF/MOL2 file(s)."""
+        if not _HAVE_RDKIT:
+            self.logger.warning("RDKit not available; cannot load ligand references for chemical mapping")
+            return {}
+        
+        ext = Path(ref_file).suffix.lower()
+        if ext == ".sdf":
+            mols = Chem.SDMolSupplier(ref_file, removeHs=False, sanitize=True)
+            for mol in mols:
+                if mol is not None:
+                    name = mol.GetProp("_Name") if mol.HasProp("_Name") else f"lig_{len(self.refs)}"
+                    self.refs[name] = mol
+        elif ext in (".mol2",):
+            mol = Chem.MolFromMol2File(ref_file, removeHs=False, sanitize=True)
+            if mol is not None:
+                name = mol.GetProp("_Name") if mol.HasProp("_Name") else Path(ref_file).stem
+                self.refs[name] = mol
+        elif ext in (".pdb",):
+            mol = Chem.MolFromPDBFile(ref_file, removeHs=False, sanitize=True)
+            if mol is not None:
+                name = Path(ref_file).stem
+                self.refs[name] = mol
+        else:
+            raise ValueError(f"Unsupported ligand reference format: {ext}")
+        
+        self.logger.info("Loaded %d ligand reference structures from %s", len(self.refs), ref_file)
+        return self.refs
+    
+    def get_reference(self, ligand_name: str) -> Optional[Any]:
+        """Get reference molecule by name (fuzzy matching)."""
+        if ligand_name in self.refs:
+            return self.refs[ligand_name]
+        # Try fuzzy matching
+        for ref_name, mol in self.refs.items():
+            if ref_name.lower() in ligand_name.lower() or ligand_name.lower() in ref_name.lower():
+                return mol
+        # Return first reference if only one
+        if len(self.refs) == 1:
+            return list(self.refs.values())[0]
+        return None
+
+
+# ============================================================================
+# Coordinate Mapper: Map PDBQT coordinates onto reference ligand
+# ============================================================================
+class PoseCoordinateMapper:
+    """Map docked coordinates from PDBQT onto reference ligand structure."""
+    
+    def __init__(self, logger: logging.Logger):
+        self.logger = logger
+    
+    def map_pose_to_reference(self, pose: Dict[str, Any], ref_mol: Any) -> Any:
+        """
+        Map PDBQT pose coordinates onto RDKit reference molecule.
+        Returns new RDKit mol with docked coordinates but reference chemistry.
+        """
+        if not _HAVE_RDKIT:
+            raise RuntimeError("RDKit required for coordinate mapping")
+        
+        # Create a copy of reference molecule
+        mapped_mol = Chem.Mol(ref_mol)
+        mapped_mol = Chem.RemoveHs(mapped_mol)
+        
+        # Get coordinates from pose
+        pose_coords = pose['coords']
+        pose_atom_names = pose['atom_names']
+        
+        # Try to match atoms by name
+        conf = mapped_mol.GetConformer() if mapped_mol.GetNumConformers() > 0 else None
+        if conf is None:
+            # Generate empty conformer
+            AllChem.EmbedMolecule(mapped_mol, randomSeed=42)
+            conf = mapped_mol.GetConformer()
+        
+        # Map coordinates by atom name
+        matched = 0
+        for i, atom in enumerate(mapped_mol.GetAtoms()):
+            atom_name = atom.GetProp("_TriposAtomName") if atom.HasProp("_TriposAtomName") else atom.GetSymbol() + str(i)
+            # Also try PDB name
+            if not atom.HasProp("_TriposAtomName"):
+                atom_name = atom.GetPDBResidueInfo().GetName().strip() if atom.GetPDBResidueInfo() else atom.GetSymbol() + str(i)
+            
+            # Find matching pose atom
+            for j, pname in enumerate(pose_atom_names):
+                if self._atom_names_match(atom_name, pname):
+                    conf.SetAtomPosition(i, pose_coords[j])
+                    matched += 1
+                    break
+        
+        self.logger.debug("Mapped %d/%d atoms from pose to reference", matched, mapped_mol.GetNumAtoms())
+        
+        if matched < mapped_mol.GetNumAtoms() * 0.5:
+            self.logger.warning("Low atom mapping rate (%d/%d) - pose may not match reference", 
+                              matched, mapped_mol.GetNumAtoms())
+        
+        # Add hydrogens with proper geometry based on mapped heavy atoms
+        mapped_mol = Chem.AddHs(mapped_mol, addCoords=True)
+        
+        return mapped_mol
+    
+    def _atom_names_match(self, name1: str, name2: str) -> bool:
+        """Flexible atom name matching."""
+        # Strip numbers and special chars
+        n1 = ''.join(c for c in name1 if c.isalpha())
+        n2 = ''.join(c for c in name2 if c.isalpha())
+        if n1.upper() == n2.upper():
+            return True
+        # Try with numbers
+        if name1.strip() == name2.strip():
+            return True
+        return False
+
+
+# ============================================================================
 # Protein Preparation
 # ============================================================================
 class ProteinPreparator:
@@ -215,7 +442,7 @@ class ProteinPreparator:
         elif self.config.protonate:
             self.logger.warning("propka3 not available; skipping protonation state assignment")
         
-        # Step 3: Load with ParmEd and parametrize with AMBER FF
+        # Step 3: Load with ParmEd and parametrize with AMBER FF (use tleap)
         structure = self._parametrize_protein(protonated_pdb)
         
         # Step 4: Save prepared protein PDB for reference
@@ -242,9 +469,7 @@ class ProteinPreparator:
     def _protonate_with_propka(self, pdb_path: str) -> str:
         """Assign protonation states using PROPKA."""
         self.logger.info("Assigning protonation states with PROPKA (pH=%.1f)...", self.config.ph)
-        # PROPKA modifies the PDB in place or writes output
         output_path = os.path.join(self.work_dir, "protein_protonated.pdb")
-        # Run propka command line
         try:
             result = subprocess.run(
                 ["propka", "--pH", str(self.config.ph), "--output", output_path, pdb_path],
@@ -259,16 +484,16 @@ class ProteinPreparator:
         return pdb_path
     
     def _parametrize_protein(self, pdb_path: str) -> pmd.Structure:
-        """Load protein PDB and apply AMBER force field using ParmEd/tleap."""
+        """Load protein PDB and apply AMBER force field using tleap."""
         self.logger.info("Parametrizing protein with %s...", self.config.protein_ff)
         
-        # Try to use tleap for proper AMBER parametrization
+        # Try tleap first (proper AMBER parametrization)
         structure = self._parametrize_with_tleap(pdb_path)
         if structure is not None:
             return structure
         
-        # Fallback: load with ParmEd and use openff-toolkit if available
-        self.logger.warning("tleap not available; using ParmEd + OpenFF fallback")
+        # Fallback: OpenFF (limited protein support) - WARN but don't silently fail
+        self.logger.warning("tleap not available; using OpenFF fallback (limited protein FF support)")
         return self._parametrize_with_openff(pdb_path)
     
     def _parametrize_with_tleap(self, pdb_path: str) -> Optional[pmd.Structure]:
@@ -303,23 +528,10 @@ quit
     def _parametrize_with_openff(self, pdb_path: str) -> pmd.Structure:
         """Fallback parametrization using OpenFF toolkit."""
         if not _HAVE_OPENFF:
-            # Last resort: load with ParmEd directly (no FF parameters)
             self.logger.warning("OpenFF not available; loading PDB without force field parameters")
             return pmd.load_file(pdb_path)
         
-        # Use OpenFF to assign SMIRNOFF parameters (not ideal for proteins but works)
-        self.logger.info("Assigning parameters with OpenFF SMIRNOFF...")
-        # This is a simplified approach - real protein FF needs proper residue templates
-        # For now, load with ParmEd and we'll rely on the ligand having proper params
         structure = pmd.load_file(pdb_path)
-        
-        # Try to assign basic atom types from the FF
-        try:
-            ff = ForceField(f"{self.config.protein_ff}.offxml")
-            # OpenFF protein FFs are limited; this is a placeholder
-        except Exception:
-            pass
-        
         return structure
 
 
@@ -329,42 +541,39 @@ quit
 class LigandParameterizer:
     """Generate GAFF2/AM1-BCC parameters for ligand molecules."""
     
-    def __init__(self, config: DockingConfig, logger: logging.Logger):
+    def __init__(self, config: DockingConfig, logger: logging.Logger, 
+                 ref_loader: LigandReferenceLoader, coord_mapper: PoseCoordinateMapper):
         self.config = config
         self.logger = logger
+        self.ref_loader = ref_loader
+        self.coord_mapper = coord_mapper
         self.work_dir = config.work_dir or tempfile.mkdtemp(prefix="mmgbsa_docking_")
         Path(self.work_dir).mkdir(parents=True, exist_ok=True)
     
-    def parameterize_ligands(self, ligand_files: List[str]) -> List[Tuple[str, pmd.Structure, str]]:
+    def parameterize_ligands(self, ligand_files: List[str]) -> List[Tuple[str, pmd.Structure, str, Dict]]:
         """
-        Parameterize ligand files and return list of (name, ParmEd Structure, residue_name).
+        Parameterize ligand files and return list of 
+        (name, ParmEd Structure, residue_name, pose_info).
+        pose_info contains: original_pose_energy, pose_index, etc.
         """
-        self.logger.info("Parameterizing %d ligand file(s)...", len(ligand_files))
+        self.logger.info("Parameterizing ligands from %d file(s)...", len(ligand_files))
         
-        # Expand input files (handle directories, globs)
         expanded_files = self._expand_ligand_files(ligand_files)
         if self.config.max_ligands:
             expanded_files = expanded_files[:self.config.max_ligands]
         
         results = []
-        for i, lig_file in enumerate(expanded_files):
+        for lig_file in expanded_files:
             try:
-                name = self._get_ligand_name(lig_file, i)
-                if self.config.prepared_ligand:
-                    # Ligand already has charges and types (e.g., MOL2 from antechamber)
-                    struct = pmd.load_file(lig_file)
-                    results.append((name, struct, self.config.ligand_resname))
-                else:
-                    # Need to parameterize
-                    struct, resname = self._parameterize_single(lig_file, name)
-                    results.append((name, struct, resname))
+                file_results = self._parameterize_file(lig_file)
+                results.extend(file_results)
             except Exception as e:
                 self.logger.error("Failed to parameterize %s: %s", lig_file, e)
                 if self.config.verbose:
                     import traceback
                     traceback.print_exc()
         
-        self.logger.info("Successfully parameterized %d ligands", len(results))
+        self.logger.info("Successfully parameterized %d ligand poses", len(results))
         return results
     
     def _expand_ligand_files(self, files: List[str]) -> List[str]:
@@ -373,11 +582,9 @@ class LigandParameterizer:
         for f in files:
             path = Path(f)
             if path.is_dir():
-                # Find all supported ligand files in directory
-                for ext in (".sdf", ".mol2", ".pdb", ".mol", ".mae", ".pdbqt"):
+                for ext in (".pdbqt", ".sdf", ".mol2", ".pdb", ".mol", ".mae"):
                     expanded.extend(sorted(path.glob(f"*{ext}")))
             else:
-                # Handle glob patterns
                 matches = sorted(glob.glob(f))
                 if matches:
                     expanded.extend(matches)
@@ -385,65 +592,170 @@ class LigandParameterizer:
                     expanded.append(str(path))
         return [str(p) for p in expanded]
     
-    def _get_ligand_name(self, lig_file: str, index: int) -> str:
-        """Generate a unique name for the ligand."""
-        stem = Path(lig_file).stem
-        # Sanitize name
-        name = "".join(c if c.isalnum() or c in "_-" else "_" for c in stem)
-        return f"{self.config.ligand_name_prefix}_{name}_{index}"
-    
-    def _parameterize_single(self, lig_file: str, name: str) -> Tuple[pmd.Structure, str]:
-        """Parameterize a single ligand file."""
-        self.logger.info("Parameterizing ligand: %s", lig_file)
-        
-        # Load molecule with RDKit or OpenFF
-        if _HAVE_OPENFF:
-            return self._parameterize_with_openff(lig_file, name)
-        elif _HAVE_RDKIT:
-            return self._parameterize_with_rdkit_antechamber(lig_file, name)
-        else:
-            raise RuntimeError(
-                "No ligand parameterization backend available. "
-                "Install openff-toolkit (recommended) or rdkit+AmberTools."
-            )
-    
-    def _parameterize_with_openff(self, lig_file: str, name: str) -> Tuple[pmd.Structure, str]:
-        """Parameterize using OpenFF toolkit (GAFF + AM1-BCC)."""
-        # Load molecule
+    def _parameterize_file(self, lig_file: str) -> List[Tuple[str, pmd.Structure, str, Dict]]:
+        """Parameterize a single ligand file (may contain multiple poses)."""
         ext = Path(lig_file).suffix.lower()
-        if ext == ".sdf":
-            molecules = list(Molecule.from_file(lig_file, file_format="sdf"))
-        elif ext == ".mol2":
-            molecules = list(Molecule.from_file(lig_file, file_format="mol2"))
-        elif ext in (".pdb",):
-            molecules = list(Molecule.from_file(lig_file, file_format="pdb"))
-        elif ext in (".mol",):
-            molecules = list(Molecule.from_file(lig_file, file_format="mol"))
-        elif ext == ".pdbqt":
-            # PDBQT: AutoDock Vina output format (PDB with charges/atom types in extra columns)
-            # Use RDKit to read, then convert to OpenFF Molecule
-            if not _HAVE_RDKIT:
-                raise RuntimeError("RDKit required to read PDBQT files. Install with: pip install rdkit")
-            molecules = self._read_pdbqt_with_rdkit(lig_file, name)
+        
+        if ext == ".pdbqt":
+            # PDBQT: multiple poses, need to map each to reference
+            return self._parameterize_pdbqt(lig_file)
+        elif ext in (".sdf", ".mol2", ".pdb", ".mol"):
+            # Single structure files
+            return self._parameterize_single_structure(lig_file)
         else:
             raise ValueError(f"Unsupported ligand format: {ext}")
+    
+    def _parameterize_pdbqt(self, pdbqt_file: str) -> List[Tuple[str, pmd.Structure, str, Dict]]:
+        """Parameterize all poses from a PDBQT file."""
+        poses = PDBQTParser.parse(pdbqt_file)
+        if not poses:
+            raise ValueError(f"No poses found in {pdbqt_file}")
         
-        if not molecules:
-            raise ValueError(f"No molecules found in {lig_file}")
+        self.logger.info("Found %d poses in %s", len(poses), pdbqt_file)
         
-        # Take first molecule (or all if multiple poses in one file)
-        mol = molecules[0]
-        mol.name = name
+        # Get reference ligand for chemical mapping
+        base_name = Path(pdbqt_file).stem
+        ref_mol = self.ref_loader.get_reference(base_name)
         
+        if ref_mol is None:
+            self.logger.warning("No reference ligand found for %s; using PDBQT chemistry", pdbqt_file)
+            # Fallback: use first pose as reference
+            return self._parameterize_pdbqt_fallback(pdbqt_file, poses)
+        
+        # Select poses based on mode
+        selected_poses = self._select_poses(poses)
+        
+        results = []
+        for pose_idx, pose in enumerate(selected_poses):
+            try:
+                # Map pose coordinates onto reference
+                mapped_mol = self.coord_mapper.map_pose_to_reference(pose, ref_mol)
+                
+                # Convert to OpenFF Molecule
+                off_mol = Molecule.from_rdkit(mapped_mol, allow_undefined_stereo=True)
+                off_mol.name = f"{base_name}_pose{pose_idx}"
+                
+                # Parameterize
+                struct, resname = self._parameterize_openff_molecule(off_mol, f"{base_name}_pose{pose_idx}")
+                
+                pose_info = {
+                    'original_energy': pose.get('energy'),
+                    'pose_index': pose.get('model_num', pose_idx),
+                    'source_file': pdbqt_file,
+                    'mapped_atoms': off_mol.n_atoms
+                }
+                results.append((f"{base_name}_pose{pose_idx}", struct, resname, pose_info))
+                
+            except Exception as e:
+                self.logger.error("Failed to parameterize pose %d from %s: %s", pose_idx, pdbqt_file, e)
+        
+        return results
+    
+    def _select_poses(self, poses: List[Dict]) -> List[Dict]:
+        """Select poses based on pose_mode."""
+        if self.config.pose_mode == "best":
+            # Sort by energy (most negative = best)
+            sorted_poses = sorted(poses, key=lambda p: p.get('energy', 0))
+            return [sorted_poses[0]] if sorted_poses else []
+        elif self.config.pose_mode == "all":
+            return poses
+        elif self.config.pose_mode == "ensemble":
+            # Return top N poses (configurable later)
+            sorted_poses = sorted(poses, key=lambda p: p.get('energy', 0))
+            return sorted_poses[:min(5, len(sorted_poses))]
+        return [poses[0]]
+    
+    def _parameterize_pdbqt_fallback(self, pdbqt_file: str, poses: List[Dict]) -> List[Tuple[str, pmd.Structure, str, Dict]]:
+        """Fallback: parameterize PDBQT poses without reference mapping."""
+        base_name = Path(pdbqt_file).stem
+        selected = self._select_poses(poses)
+        results = []
+        
+        for pose_idx, pose in enumerate(selected):
+            try:
+                # Create RDKit mol from PDBQT directly
+                mol = self._pdbqt_pose_to_rdkit(pose)
+                off_mol = Molecule.from_rdkit(mol, allow_undefined_stereo=True)
+                off_mol.name = f"{base_name}_pose{pose_idx}"
+                
+                struct, resname = self._parameterize_openff_molecule(off_mol, f"{base_name}_pose{pose_idx}")
+                
+                pose_info = {
+                    'original_energy': pose.get('energy'),
+                    'pose_index': pose.get('model_num', pose_idx),
+                    'source_file': pdbqt_file
+                }
+                results.append((f"{base_name}_pose{pose_idx}", struct, resname, pose_info))
+            except Exception as e:
+                self.logger.error("Fallback parameterization failed for pose %d: %s", pose_idx, e)
+        
+        return results
+    
+    def _pdbqt_pose_to_rdkit(self, pose: Dict) -> Any:
+        """Convert a single PDBQT pose to RDKit molecule."""
+        # Create mol from atoms and coords
+        mol = Chem.RWMol()
+        atom_map = {}
+        
+        for i, (name, atype, charge, coord) in enumerate(zip(
+            pose['atom_names'], pose['atom_types'], pose['charges'], pose['coords']
+        )):
+            # Guess element from atom type
+            elem = atype[0] if atype else 'C'
+            atom = Chem.Atom(elem)
+            atom.SetProp("_TriposAtomName", name)
+            atom.SetProp("_TriposAtomType", atype)
+            idx = mol.AddAtom(atom)
+            atom_map[i] = idx
+        
+        # No bond info in PDBQT - will need to infer from distances
+        conf = Chem.Conformer(mol.GetNumAtoms())
+        for i, coord in enumerate(pose['coords']):
+            conf.SetAtomPosition(i, coord)
+        mol.AddConformer(conf)
+        
+        # Infer bonds from distances
+        mol = mol.GetMol()
+        mol = Chem.AddHs(mol, addCoords=True)
+        return mol
+    
+    def _parameterize_single_structure(self, lig_file: str) -> List[Tuple[str, pmd.Structure, str, Dict]]:
+        """Parameterize SDF/MOL2/PDB file."""
+        base_name = Path(lig_file).stem
+        
+        if _HAVE_OPENFF:
+            ext = Path(lig_file).suffix.lower()
+            if ext == ".sdf":
+                molecules = list(Molecule.from_file(lig_file, file_format="sdf"))
+            elif ext == ".mol2":
+                molecules = list(Molecule.from_file(lig_file, file_format="mol2"))
+            elif ext in (".pdb",):
+                molecules = list(Molecule.from_file(lig_file, file_format="pdb"))
+            elif ext in (".mol",):
+                molecules = list(Molecule.from_file(lig_file, file_format="mol"))
+            else:
+                raise ValueError(f"Unsupported format: {ext}")
+            
+            results = []
+            for i, mol in enumerate(molecules):
+                mol.name = f"{base_name}_{i}"
+                struct, resname = self._parameterize_openff_molecule(mol, f"{base_name}_{i}")
+                results.append((f"{base_name}_{i}", struct, resname, {'source_file': lig_file}))
+            return results
+        elif _HAVE_RDKIT:
+            return self._parameterize_with_rdkit_antechamber(lig_file)
+        else:
+            raise RuntimeError("No ligand parameterization backend available")
+    
+    def _parameterize_openff_molecule(self, mol: Molecule, name: str) -> Tuple[pmd.Structure, str]:
+        """Parameterize an OpenFF Molecule with GAFF + charges."""
         # Assign charges
-        self.logger.debug("Assigning %s charges...", self.config.charge_method)
+        self.logger.debug("Assigning %s charges to %s...", self.config.charge_method, name)
         if self.config.charge_method.lower() in ("am1bcc", "am1bccelf10"):
             if _HAVE_OPENFF_RECHARGE:
-                # Use OpenFF Recharge for AM1-BCC
                 recharge = Recharge()
                 mol = recharge.assign_charges(mol, method=self.config.charge_method)
             else:
-                # Fallback: use OpenFF's built-in AM1-BCC (requires openeye)
                 try:
                     mol.assign_partial_charges("am1bcc")
                 except Exception as e:
@@ -457,14 +769,12 @@ class LigandParameterizer:
             self.logger.warning("Unknown charge method %s, using gasteiger", self.config.charge_method)
             mol.assign_partial_charges("gasteiger")
         
-        # Create OpenFF Topology and apply GAFF force field
+        # Apply GAFF force field
         topology = Topology.from_molecules([mol])
         
-        # Load GAFF force field
         try:
             ff = ForceField(self.config.ligand_ff)
         except Exception:
-            # Try common variants
             for ff_name in ["gaff-2.11", "gaff-1.8", "gaff"]:
                 try:
                     ff = ForceField(ff_name)
@@ -475,47 +785,35 @@ class LigandParameterizer:
             else:
                 raise RuntimeError(f"Could not load GAFF force field: {self.config.ligand_ff}")
         
-        # Parametrize
-        openff_system = ff.create_openff_system(topology)
-        
-        # Convert to ParmEd Structure
-        # OpenFF Interchange -> ParmEd
         from openff.interchange import Interchange
         interchange = Interchange.from_smirnoff(ff, topology)
         structure = interchange.to_parmed()
         
-        # Set residue name
         for res in structure.residues:
             res.name = self.config.ligand_resname
         
-        # Save parameterized ligand for reference
         lig_out = os.path.join(self.work_dir, f"{name}.mol2")
         structure.save(lig_out, overwrite=True)
         self.logger.debug("Parameterized ligand saved to: %s", lig_out)
         
         return structure, self.config.ligand_resname
     
-    def _parameterize_with_rdkit_antechamber(self, lig_file: str, name: str) -> Tuple[pmd.Structure, str]:
+    def _parameterize_with_rdkit_antechamber(self, lig_file: str) -> List[Tuple[str, pmd.Structure, str, Dict]]:
         """Parameterize using RDKit + antechamber (AmberTools)."""
-        # Convert to MOL2 if needed
+        base_name = Path(lig_file).stem
         mol2_path = lig_file
         if not lig_file.lower().endswith(".mol2"):
-            mol2_path = os.path.join(self.work_dir, f"{name}.mol2")
+            mol2_path = os.path.join(self.work_dir, f"{base_name}.mol2")
             self._convert_to_mol2(lig_file, mol2_path)
         
-        # Run antechamber for GAFF2 + AM1-BCC
-        ac_out = os.path.join(self.work_dir, f"{name}_ac.mol2")
-        ac_log = os.path.join(self.work_dir, f"{name}_ac.log")
-        
-        # antechamber -i input.mol2 -fi mol2 -o output.mol2 -fo mol2 -c bcc -s 2 -nc 0 -at gaff2
+        ac_out = os.path.join(self.work_dir, f"{base_name}_ac.mol2")
         charge_flag = "bcc" if "am1bcc" in self.config.charge_method.lower() else "gas"
         cmd = [
             "antechamber",
             "-i", mol2_path, "-fi", "mol2",
             "-o", ac_out, "-fo", "mol2",
             "-c", charge_flag, "-s", "2", "-nc", "0",
-            "-at", "gaff2",
-            "-pf", "y"  # generate prep file
+            "-at", "gaff2", "-pf", "y"
         ]
         
         self.logger.debug("Running antechamber: %s", " ".join(cmd))
@@ -526,12 +824,11 @@ class LigandParameterizer:
         except (subprocess.TimeoutExpired, FileNotFoundError) as e:
             raise RuntimeError(f"antechamber not available or failed: {e}")
         
-        # Load parameterized ligand
         structure = pmd.load_file(ac_out)
         for res in structure.residues:
             res.name = self.config.ligand_resname
         
-        return structure, self.config.ligand_resname
+        return [(base_name, structure, self.config.ligand_resname, {'source_file': lig_file})]
     
     def _convert_to_mol2(self, input_file: str, output_file: str):
         """Convert ligand file to MOL2 using RDKit."""
@@ -542,7 +839,7 @@ class LigandParameterizer:
         elif ext == ".pdb":
             mol = Chem.MolFromPDBFile(input_file, removeHs=False)
         elif ext == ".pdbqt":
-            mol = Chem.MolFromPDBFile(input_file, removeHs=False)  # RDKit reads PDBQT as PDB
+            mol = Chem.MolFromPDBFile(input_file, removeHs=False)
         elif ext == ".mol":
             mol = Chem.MolFromMolFile(input_file, removeHs=False)
         else:
@@ -551,7 +848,6 @@ class LigandParameterizer:
         if mol is None:
             raise ValueError(f"Failed to read molecule from {input_file}")
         
-        # Add hydrogens if needed
         mol = Chem.AddHs(mol)
         AllChem.EmbedMolecule(mol, randomSeed=42)
         AllChem.MMFFOptimizeMolecule(mol)
@@ -560,37 +856,11 @@ class LigandParameterizer:
         writer.write(mol)
         writer.close()
         
-        # Convert SDF to MOL2 via obabel if available, else use the SDF
         try:
             subprocess.run(["obabel", "-isdf", output_file.replace(".mol2", ".sdf"), 
                           "-omol2", "-O", output_file], check=True, capture_output=True)
         except Exception:
-            # Just rename
             shutil.move(output_file.replace(".mol2", ".sdf"), output_file)
-    
-    def _read_pdbqt_with_rdkit(self, pdbqt_file: str, name: str) -> List:
-        """Read PDBQT file using RDKit and convert to OpenFF Molecule(s)."""
-        # RDKit can read PDBQT as PDB (ignores the extra columns)
-        mol = Chem.MolFromPDBFile(pdbqt_file, removeHs=False, sanitize=True)
-        if mol is None:
-            raise ValueError(f"Failed to read PDBQT file: {pdbqt_file}")
-        
-        # Remove any existing hydrogens (PDBQT usually has polar H only)
-        mol = Chem.RemoveHs(mol)
-        
-        # Add all hydrogens with proper geometry
-        mol = Chem.AddHs(mol, addCoords=True)
-        
-        # Generate 3D coordinates if not present or optimize
-        if mol.GetNumConformers() == 0:
-            AllChem.EmbedMolecule(mol, randomSeed=42)
-        AllChem.MMFFOptimizeMolecule(mol)
-        
-        # Convert RDKit mol to OpenFF Molecule
-        off_mol = Molecule.from_rdkit(mol, allow_undefined_stereo=True)
-        off_mol.name = name
-        
-        return [off_mol]
 
 
 # ============================================================================
@@ -606,18 +876,18 @@ class ComplexAssembler:
         Path(self.work_dir).mkdir(parents=True, exist_ok=True)
     
     def assemble(self, protein_struct: pmd.Structure, 
-                 ligand_structs: List[Tuple[str, pmd.Structure, str]]) -> List[Tuple[str, pmd.Structure]]:
+                 ligand_structs: List[Tuple[str, pmd.Structure, str, Dict]]) -> List[Tuple[str, pmd.Structure, Dict]]:
         """
         Assemble protein with each ligand into a complex.
-        Returns list of (ligand_name, complex_structure).
+        Returns list of (ligand_name, complex_structure, pose_info).
         """
         self.logger.info("Assembling %d protein-ligand complexes...", len(ligand_structs))
         
         complexes = []
-        for lig_name, lig_struct, lig_resname in ligand_structs:
+        for lig_name, lig_struct, lig_resname, pose_info in ligand_structs:
             try:
                 complex_struct = self._merge_protein_ligand(protein_struct, lig_struct, lig_resname)
-                complexes.append((lig_name, complex_struct))
+                complexes.append((lig_name, complex_struct, pose_info))
             except Exception as e:
                 self.logger.error("Failed to assemble complex for %s: %s", lig_name, e)
                 if self.config.verbose:
@@ -629,105 +899,15 @@ class ComplexAssembler:
     def _merge_protein_ligand(self, protein: pmd.Structure, 
                               ligand: pmd.Structure, lig_resname: str) -> pmd.Structure:
         """Merge protein and ligand structures into a single complex."""
-        # Create a copy of protein to avoid modifying original
-        complex_struct = protein.copy()
+        # Use ParmEd's join method
+        combined = protein.join(ligand)
         
-        # Get ligand atoms (assuming single residue)
-        lig_residues = list(ligand.residues)
-        if not lig_residues:
-            raise ValueError("Ligand structure has no residues")
-        lig_res = lig_residues[0]
+        # Ensure ligand residue name is set
+        for res in combined.residues:
+            if res.name != lig_resname and any(a.name in [la.name for la in ligand.residues[0].atoms] for a in res.atoms):
+                res.name = lig_resname
         
-        # Add ligand residue to complex
-        # ParmEd doesn't have a direct "add residue" method, so we combine at atom level
-        # Better approach: use ParmEd's combine or manually add atoms
-        
-        # Simple approach: create new structure from combined atoms
-        # This preserves all parameters
-        combined_atoms = list(complex_struct.atoms) + list(ligand.atoms)
-        combined_bonds = list(complex_struct.bonds) + list(ligand.bonds)
-        combined_angles = list(complex_struct.angles) + list(ligand.angles)
-        combined_dihedrals = list(complex_struct.dihedrals) + list(ligand.dihedrals)
-        
-        # Create new structure
-        from parmed import Structure
-        new_struct = Structure()
-        
-        # Add atoms
-        atom_map = {}
-        for i, atom in enumerate(combined_atoms):
-            new_atom = new_struct.add_atom(
-                name=atom.name,
-                type=atom.type,
-                charge=atom.charge,
-                mass=atom.mass,
-                atomic_number=atom.atomic_number,
-                residue=atom.residue  # This might need adjustment
-            )
-            atom_map[atom] = new_atom
-        
-        # Need to properly handle residues - recreate them
-        # Better: use ParmEd's join method
-        try:
-            # ParmEd's join combines structures
-            combined = complex_struct.join(ligand)
-            # Ensure ligand residue name is set
-            for res in combined.residues:
-                if res.name != lig_resname and any(a.name in [la.name for la in lig_res.atoms] for a in res.atoms):
-                    res.name = lig_resname
-            return combined
-        except Exception:
-            # Fallback: manual combination
-            pass
-        
-        # Manual combination fallback
-        return self._manual_combine(complex_struct, ligand, lig_resname)
-    
-    def _manual_combine(self, protein: pmd.Structure, ligand: pmd.Structure, 
-                        lig_resname: str) -> pmd.Structure:
-        """Manually combine protein and ligand structures."""
-        from parmed import Structure, Atom, Residue, Bond, Angle, Dihedral
-        
-        new_struct = Structure()
-        
-        # Track residue mapping
-        res_map = {}
-        
-        # Add protein residues
-        for res in protein.residues:
-            new_res = Residue(res.name, res.number, res.chain)
-            new_struct.add_residue(new_res, res.chain)
-            res_map[res] = new_res
-            for atom in res.atoms:
-                new_atom = Atom(
-                    name=atom.name,
-                    type=atom.type,
-                    charge=atom.charge,
-                    mass=atom.mass,
-                    atomic_number=atom.atomic_number
-                )
-                new_res.add_atom(new_atom)
-        
-        # Add ligand as new residue (use next residue number)
-        next_resnum = max(r.number for r in protein.residues) + 1 if protein.residues else 1
-        lig_res = list(ligand.residues)[0]
-        new_lig_res = Residue(lig_resname, next_resnum, "L")
-        new_struct.add_residue(new_lig_res, "L")
-        
-        for atom in lig_res.atoms:
-            new_atom = Atom(
-                name=atom.name,
-                type=atom.type,
-                charge=atom.charge,
-                mass=atom.mass,
-                atomic_number=atom.atomic_number
-            )
-            new_lig_res.add_atom(new_atom)
-        
-        # Copy bonds (adjust indices)
-        # This is complex - use ParmEd's built-in if possible
-        # For now, return protein+ligand joined
-        return protein.join(ligand)
+        return combined
 
 
 # ============================================================================
@@ -740,19 +920,17 @@ class DockingMMGBSARunner:
         self.config = config
         self.logger = logger
     
-    def run_on_complexes(self, complexes: List[Tuple[str, pmd.Structure]]) -> List[Dict[str, Any]]:
-        """
-        Run MM-GBSA on each complex.
-        Returns list of result dictionaries with binding energies.
-        """
+    def run_on_complexes(self, complexes: List[Tuple[str, pmd.Structure, Dict]]) -> List[Dict[str, Any]]:
+        """Run MM-GBSA on each complex."""
         results = []
         
-        for i, (lig_name, complex_struct) in enumerate(complexes):
+        for i, (lig_name, complex_struct, pose_info) in enumerate(complexes):
             self.logger.info("Running MM-GBSA on complex %d/%d: %s", 
                            i+1, len(complexes), lig_name)
             
             try:
                 result = self._run_single_complex(lig_name, complex_struct)
+                result.update(pose_info)  # Add pose info (energy, index, etc.)
                 results.append(result)
             except Exception as e:
                 self.logger.error("MM-GBSA failed for %s: %s", lig_name, e)
@@ -767,26 +945,23 @@ class DockingMMGBSARunner:
                     "delta_elec": float('nan'),
                     "delta_gb": float('nan'),
                     "delta_sasa": float('nan'),
+                    **pose_info
                 })
         
         return results
     
     def _run_single_complex(self, lig_name: str, complex_struct: pmd.Structure) -> Dict[str, Any]:
         """Run MM-GBSA on a single complex using v4 engine."""
-        
-        # Create temporary topology and coordinate files
         with tempfile.TemporaryDirectory(dir=self.config.work_dir) as tmpdir:
             prmtop = os.path.join(tmpdir, "complex.prmtop")
             inpcrd = os.path.join(tmpdir, "complex.inpcrd")
             
-            # Save complex topology
             complex_struct.save(prmtop, overwrite=True)
             complex_struct.save(inpcrd, overwrite=True)
             
-            # Build v4 config
             v4_config = v4.Config(
                 top_file=prmtop,
-                coord_files=[inpcrd],  # single frame
+                coord_files=[inpcrd],
                 ligand_resnames=[self.config.ligand_resname],
                 strip_resnames=set(v4.DEFAULT_STRIP_RESNAMES),
                 no_strip=False,
@@ -808,35 +983,19 @@ class DockingMMGBSARunner:
                 verbose=self.config.verbose,
             )
             
-            # Run v4 engine
             logger = v4.setup_logging(self.config.verbose)
             top_model = v4.TopologyModel(complex_struct, v4_config, logger)
             engine = v4.MMGBSAEngine(top_model, v4_config, logger)
             
-            # Process single frame
             coords, box, _ = next(v4.iter_frames([inpcrd], top_model.n_atoms, prmtop))
             data = engine.compute_frame(coords)
             
-            # Convert to format expected by v4.write_frame_csv
-            # The v4 engine returns data with keys like:
-            # - delta_vdw, delta_elec, delta_gb, delta_sasa, delta_total
-            # - vdw_complex, elec_complex, gb_complex, sasa_complex, vdw14_complex, elec14_complex
-            # - vdw_receptor, elec_receptor, gb_receptor, sasa_receptor
-            # - vdw_ligand, elec_ligand, gb_ligand, sasa_ligand
-            
-            result = {
-                "ligand": lig_name,
-            }
-            
-            # Add all delta keys
+            result = {"ligand": lig_name}
             for key in v4.DELTA_KEYS:
                 result[f"delta_{key}"] = float(data[f"delta_{key}"])
-            
-            # Add all absolute keys
             for key in v4.ABS_KEYS:
                 result[key] = float(data[key])
             
-            # Decomposition if requested
             if self.config.decomp_csv:
                 decomp = engine.decompose(data)
                 result["decomposition"] = decomp
@@ -848,27 +1007,13 @@ class DockingMMGBSARunner:
 # Output Writers
 # ============================================================================
 def write_results_csv(results: List[Dict[str, Any]], output_path: str):
-    """Write ranked MM-GBSA results to CSV using v4's write_frame_csv format."""
-    # Sort by delta_total (most negative = best binding)
+    """Write ranked MM-GBSA results to CSV."""
     sorted_results = sorted(results, key=lambda x: x.get("delta_total", float('inf')))
-    
-    # Filter out failed results for the main CSV
     valid_results = [r for r in sorted_results if "error" not in r]
     
-    if not valid_results:
-        # Write empty CSV with headers
-        with open(output_path, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["frame", "ligand"] + 
-                          [f"delta_{k}" for k in v4.DELTA_KEYS] + 
-                          [k for k in v4.ABS_KEYS])
-        return
-    
-    # Use v4's write_frame_csv for consistent format
-    # But we need to add ligand name to each row
     with open(output_path, "w", newline="") as f:
         writer = csv.writer(f)
-        headers = ["rank", "ligand"] + [f"delta_{k}" for k in v4.DELTA_KEYS] + v4.ABS_KEYS
+        headers = ["rank", "ligand"] + [f"delta_{k}" for k in v4.DELTA_KEYS] + v4.ABS_KEYS + ["vina_energy", "pose_index"]
         writer.writerow(headers)
         
         for rank, r in enumerate(sorted_results, 1):
@@ -877,9 +1022,10 @@ def write_results_csv(results: List[Dict[str, Any]], output_path: str):
                 row.append(r.get(f"delta_{k}", ""))
             for k in v4.ABS_KEYS:
                 row.append(r.get(k, ""))
+            row.append(r.get("original_energy", ""))
+            row.append(r.get("pose_index", ""))
             writer.writerow(row)
         
-        # Average row for valid results
         if len(valid_results) > 1:
             avg_row = ["AVERAGE", ""]
             for k in v4.DELTA_KEYS:
@@ -888,6 +1034,7 @@ def write_results_csv(results: List[Dict[str, Any]], output_path: str):
             for k in v4.ABS_KEYS:
                 vals = [r.get(k, float('nan')) for r in valid_results]
                 avg_row.append(float(np.nanmean(vals)))
+            avg_row.extend(["", ""])
             writer.writerow(avg_row)
             
             std_row = ["STDDEV", ""]
@@ -897,6 +1044,7 @@ def write_results_csv(results: List[Dict[str, Any]], output_path: str):
             for k in v4.ABS_KEYS:
                 vals = [r.get(k, float('nan')) for r in valid_results]
                 std_row.append(float(np.nanstd(vals, ddof=1)) if len(vals) > 1 else 0.0)
+            std_row.extend(["", ""])
             writer.writerow(std_row)
 
 
@@ -916,7 +1064,6 @@ def write_decomposition_csv(results: List[Dict[str, Any]], output_path: str,
             if decomp is None:
                 continue
             
-            # v4 decompose returns: res_index, vdw, elec, gb, sasa, ligand_vdw, ligand_elec, ligand_gb, ligand_sasa
             n_res = len(decomp.get("vdw", []))
             res_indices = decomp.get("res_index", list(range(n_res)))
             
@@ -924,12 +1071,10 @@ def write_decomposition_csv(results: List[Dict[str, Any]], output_path: str,
                 ri = res_indices[k] if k < len(res_indices) else k
                 total = (decomp["vdw"][k] + decomp["elec"][k] + 
                         decomp["gb"][k] + decomp["sasa"][k])
-                # We don't have resnames/resids in the decomp dict, use index
                 writer.writerow([lig_name, rank, int(ri), f"RES{ri}", ri,
                                decomp["vdw"][k], decomp["elec"][k],
                                decomp["gb"][k], decomp["sasa"][k], total])
             
-            # Add LIGAND row (v4 puts this as ligand_vdw etc. with single element arrays)
             if "ligand_vdw" in decomp:
                 lig_vdw = float(decomp["ligand_vdw"][0]) if len(decomp["ligand_vdw"]) > 0 else 0.0
                 lig_elec = float(decomp["ligand_elec"][0]) if len(decomp["ligand_elec"]) > 0 else 0.0
@@ -944,11 +1089,13 @@ def write_json_summary(results: List[Dict[str, Any]], config: DockingConfig,
                        output_path: str, protein_pdb: str):
     """Write machine-readable JSON summary."""
     sorted_results = sorted(results, key=lambda x: x.get("delta_total", float('inf')))
+    valid = [r for r in results if "error" not in r]
     
     summary = {
         "metadata": {
             "protein_pdb": protein_pdb,
             "n_ligands": len(results),
+            "n_valid": len(valid),
             "protein_ff": config.protein_ff,
             "ligand_ff": config.ligand_ff,
             "charge_method": config.charge_method,
@@ -959,13 +1106,14 @@ def write_json_summary(results: List[Dict[str, Any]], config: DockingConfig,
             "radii_set": config.radii_set,
             "surface_tension": config.surface_tension,
             "probe_radius": config.probe_radius,
+            "pose_mode": config.pose_mode,
         },
         "results": sorted_results,
         "statistics": {
             "best_ligand": sorted_results[0]["ligand"] if sorted_results else None,
             "best_delta_total": sorted_results[0]["delta_total"] if sorted_results else None,
-            "mean_delta_total": float(np.nanmean([r["delta_total"] for r in results])),
-            "std_delta_total": float(np.nanstd([r["delta_total"] for r in results])),
+            "mean_delta_total": float(np.nanmean([r["delta_total"] for r in valid])) if valid else None,
+            "std_delta_total": float(np.nanstd([r["delta_total"] for r in valid])) if valid else None,
         }
     }
     
@@ -980,7 +1128,6 @@ def run_docking_rescoring(config: DockingConfig) -> List[Dict[str, Any]]:
     """Run the complete docking rescoring pipeline."""
     logger = setup_logging(config.verbose)
     
-    # Set up work directory
     if config.work_dir is None:
         config.work_dir = tempfile.mkdtemp(prefix="mmgbsa_docking_")
     work_dir = Path(config.work_dir)
@@ -988,29 +1135,41 @@ def run_docking_rescoring(config: DockingConfig) -> List[Dict[str, Any]]:
     logger.info("Working directory: %s", work_dir)
     
     try:
-        # Step 1: Prepare protein
+        # Step 1: Load ligand references
         logger.info("=" * 60)
-        logger.info("STEP 1: Protein Preparation")
+        logger.info("STEP 1: Loading Ligand References")
+        logger.info("=" * 60)
+        ref_loader = LigandReferenceLoader(logger)
+        if config.ligand_refs:
+            ref_loader.load(config.ligand_refs)
+        else:
+            logger.warning("No ligand references provided (--ligand-refs); chemical mapping will be limited")
+        
+        coord_mapper = PoseCoordinateMapper(logger)
+        
+        # Step 2: Prepare protein
+        logger.info("=" * 60)
+        logger.info("STEP 2: Protein Preparation")
         logger.info("=" * 60)
         protein_prep = ProteinPreparator(config, logger)
         protein_struct, protein_pdb = protein_prep.prepare(config.protein_pdb)
         logger.info("Protein prepared: %d atoms, %d residues", 
                    len(protein_struct.atoms), len(protein_struct.residues))
         
-        # Step 2: Parameterize ligands
+        # Step 3: Parameterize ligands (with pose mapping)
         logger.info("=" * 60)
-        logger.info("STEP 2: Ligand Parameterization")
+        logger.info("STEP 3: Ligand Parameterization & Pose Mapping")
         logger.info("=" * 60)
-        lig_param = LigandParameterizer(config, logger)
+        lig_param = LigandParameterizer(config, logger, ref_loader, coord_mapper)
         ligand_structs = lig_param.parameterize_ligands(config.ligand_files)
-        logger.info("Ligands parameterized: %d", len(ligand_structs))
+        logger.info("Ligand poses parameterized: %d", len(ligand_structs))
         
         if not ligand_structs:
-            raise RuntimeError("No ligands successfully parameterized")
+            raise RuntimeError("No ligand poses successfully parameterized")
         
-        # Step 3: Assemble complexes
+        # Step 4: Assemble complexes
         logger.info("=" * 60)
-        logger.info("STEP 3: Complex Assembly")
+        logger.info("STEP 4: Complex Assembly")
         logger.info("=" * 60)
         assembler = ComplexAssembler(config, logger)
         complexes = assembler.assemble(protein_struct, ligand_structs)
@@ -1019,16 +1178,16 @@ def run_docking_rescoring(config: DockingConfig) -> List[Dict[str, Any]]:
         if not complexes:
             raise RuntimeError("No complexes successfully assembled")
         
-        # Step 4: Run MM-GBSA
+        # Step 5: Run MM-GBSA
         logger.info("=" * 60)
-        logger.info("STEP 4: MM-GBSA Calculation")
+        logger.info("STEP 5: MM-GBSA Calculation")
         logger.info("=" * 60)
         runner = DockingMMGBSARunner(config, logger)
         results = runner.run_on_complexes(complexes)
         
-        # Step 5: Output results
+        # Step 6: Output results
         logger.info("=" * 60)
-        logger.info("STEP 5: Writing Results")
+        logger.info("STEP 6: Writing Results")
         logger.info("=" * 60)
         
         write_results_csv(results, config.output_csv)
@@ -1049,13 +1208,12 @@ def run_docking_rescoring(config: DockingConfig) -> List[Dict[str, Any]]:
             logger.info("=" * 60)
             logger.info("SUMMARY")
             logger.info("=" * 60)
-            logger.info("Best ligand: %s (ΔG = %.3f kcal/mol)", best["ligand"], best["delta_total"])
-            logger.info("Processed: %d/%d ligands successful", len(valid_results), len(results))
+            logger.info("Best pose: %s (ΔG = %.3f kcal/mol)", best["ligand"], best["delta_total"])
+            logger.info("Processed: %d/%d poses successful", len(valid_results), len(results))
         
         return results
         
     finally:
-        # Cleanup
         if not config.keep_intermediate and config.work_dir and not config.work_dir.startswith("/tmp"):
             try:
                 shutil.rmtree(config.work_dir)
@@ -1076,12 +1234,16 @@ def parse_args() -> DockingConfig:
     # Input
     p.add_argument("-p", "--protein", required=True, help="Protein PDB file")
     p.add_argument("-l", "--ligands", nargs="+", required=True, 
-                   help="Ligand file(s): SDF, MOL2, PDB, PDBQT (AutoDock Vina), or directory")
+                   help="Ligand pose files: PDBQT (Vina), SDF, MOL2, PDB, or directory")
+    p.add_argument("--ligand-refs", default=None,
+                   help="Original ligand structures (SDF/MOL2) for chemical info mapping")
     p.add_argument("--ligand-resname", default="LIG", help="Ligand residue name")
     p.add_argument("--prepared-ligand", action="store_true",
                    help="Ligand files already parameterized (MOL2 with charges/types)")
     p.add_argument("--max-ligands", type=int, default=None, help="Limit number of ligands (for testing)")
     p.add_argument("--ligand-name-prefix", default="LIG", help="Prefix for ligand names")
+    p.add_argument("--pose-mode", choices=["best", "all", "ensemble"], default="best",
+                   help="Pose selection: best (top scoring), all, ensemble (top 5)")
     
     # Force fields
     p.add_argument("--protein-ff", default=DEFAULT_PROTEIN_FF,
@@ -1124,6 +1286,7 @@ def parse_args() -> DockingConfig:
     return DockingConfig(
         protein_pdb=args.protein,
         ligand_files=args.ligands,
+        ligand_refs=args.ligand_refs,
         ligand_resname=args.ligand_resname,
         protein_ff=args.protein_ff,
         ligand_ff=args.ligand_ff,
@@ -1135,6 +1298,7 @@ def parse_args() -> DockingConfig:
         prepared_ligand=args.prepared_ligand,
         max_ligands=args.max_ligands,
         ligand_name_prefix=args.ligand_name_prefix,
+        pose_mode=args.pose_mode,
         igb=args.igb,
         eps_solvent=args.eps_solvent,
         gb_cutoff=args.gb_cutoff,

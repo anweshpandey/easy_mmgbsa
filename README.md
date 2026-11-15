@@ -205,36 +205,68 @@ Docking programs output poses with arbitrary atom naming, no partial charges, no
 
 ### The Solution: Physics-Based Preparation Pipeline
 
-`mmgbsa_docking.py` implements a complete preparation pipeline:
+`mmgbsa_docking.py` implements a complete preparation pipeline specifically designed for AutoDock Vina and other docking programs:
 
 ```
-Docked PDB/SDF/MOL2
-        │
-        ▼
-┌───────────────────┐
-│  Ligand           │
-│  Parameterization │──► GAFF2 atom types + AM1-BCC charges (OpenFF/antechamber)
-└───────────────────┘
-        │
-        ▼
-┌───────────────────┐
-│  Protein          │
-│  Preparation      │──► Fix structure (PDBFixer), protonate (PROPKA), add H, assign FF
-└───────────────────┘
-        │
-        ▼
-┌───────────────────┐
-│  Complex Assembly │──► Merge protein + ligand into single AMBER topology
-└───────────────────┘
-        │
-        ▼
-┌───────────────────┐
-│  MM-GBSA Engine   │──► Validated OBC GB + SASA (mmgbsa_amb.py v4)
-└───────────────────┘
-        │
-        ▼
-   Ranked ΔGbind
+AutoDock Vina PDBQT poses  +  Original ligand SDF/MOL2 (for chemistry)
+            │                              │
+            ▼                              ▼
+    ┌──────────────────┐            ┌──────────────────┐
+    │  PDBQT Parser    │            │  Reference       │
+    │  - All MODEL     │            │  Loader          │
+    │    blocks parsed │            │  - Bond orders   │
+    │  - Energies kept │            │  - Stereochemistry
+    └────────┬─────────┘            └────────┬─────────┘
+             │                               │
+             └──────────────┬────────────────┘
+                            ▼
+                 ┌──────────────────────┐
+                 │  Pose Coordinate     │
+                 │  Mapper              │
+                 │  - Map PDBQT coords  │
+                 │    onto reference    │
+                 │  - NO optimization   │
+                 │    (preserves pose)  │
+                 │  - Add H after map   │
+                 └──────────┬───────────┘
+                            ▼
+                 ┌──────────────────────┐
+                 │  Ligand              │
+                 │  Parameterization    │
+                 │  - GAFF2 + AM1-BCC   │
+                 └──────────┬───────────┘
+                            ▼
+                 ┌──────────────────────┐
+                 │  Protein             │
+                 │  Preparation         │
+                 │  - PDBFixer + PROPKA │
+                 │  - tleap (AMBER FF)  │
+                 └──────────┬───────────┘
+                            ▼
+                 ┌──────────────────────┐
+                 │  Complex Assembly    │
+                 │  - Merge protein +   │
+                 │    ligand            │
+                 └──────────┬───────────┘
+                            ▼
+                 ┌──────────────────────┐
+                 │  MM-GBSA Engine      │
+                 │  - Validated OBC GB  │
+                 │    (mmgbsa_amb.py v4)│
+                 └──────────┬───────────┘
+                            ▼
+                       Ranked ΔGbind
 ```
+
+### Key Features for Docking Rescoring
+
+| Feature | Description |
+|---------|-------------|
+| **Multi-pose PDBQT** | Parses all `MODEL`/`ENDMDL` blocks from Vina output |
+| **Chemical mapping** | Uses original ligand SDF/MOL2 for bond orders & stereochemistry |
+| **Pose preservation** | Maps coordinates WITHOUT geometry optimization |
+| **Pose selection** | `--pose-mode best|all|ensemble` (top 1, all, or top 5) |
+| **Traceability** | Output includes Vina energy & pose index |
 
 ### Ligand Parameterization Details
 
@@ -260,9 +292,20 @@ Docked PDB/SDF/MOL2
 
 | File | Description |
 |------|-------------|
-| `results.csv` | Ranked ligands: `rank`, `ligand`, `delta_total`, `delta_vdw`, `delta_elec`, `delta_gb`, `delta_sasa` + absolute components |
-| `decomp.csv` | Per-residue decomposition for all ligands (merged, with `ligand` and `rank` columns) |
+| `results.csv` | Ranked poses: `rank`, `ligand`, `delta_total`, `delta_vdw`, `delta_elec`, `delta_gb`, `delta_sasa` + absolute components + `vina_energy`, `pose_index` |
+| `decomp.csv` | Per-residue decomposition for all poses (merged, with `ligand`, `rank` columns) |
 | `summary.json` | Machine-readable: config, all results, statistics (best, mean, std) |
+
+---
+
+### Docking Rescoring Example
+
+See [`examples/docking_rescoring_example.md`](examples/docking_rescoring_example.md) for a complete walkthrough with:
+- Installation instructions
+- Input file preparation
+- Command-line options explained
+- Output file formats
+- Troubleshooting common issues
 
 ---
 
