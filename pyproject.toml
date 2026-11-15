@@ -29,10 +29,6 @@ dependencies = [
     "numpy>=1.21",
     "scipy>=1.7",
     "parmed>=4.0",
-]
-[project.optional-dependencies]
-xtc = ["mdanalysis>=2.0"]
-docking = [
     "openff-toolkit>=0.14",
     "openff-recharge>=0.3",
     "openff-interchange>=0.5",
@@ -40,6 +36,8 @@ docking = [
     "propka3>=3.4",
     "rdkit>=2023.03",
 ]
+[project.optional-dependencies]
+xtc = ["mdanalysis>=2.0"]
 dev = ["pytest", "black", "ruff"]
 
 [project.scripts]

@@ -5,11 +5,8 @@ This example demonstrates how to use `mmgbsa_docking.py` for physics-based resco
 ## Prerequisites
 
 ```bash
-# Install docking dependencies
-pip install "easy-mmgbsa[docking]"
-
-# Or install individually:
-# pip install openff-toolkit openff-recharge openff-interchange pdbfixer propka3 rdkit
+# Install easy_mmgbsa (includes all docking dependencies)
+pip install easy-mmgbsa
 
 # System dependencies (for AMBER force fields):
 # conda install -c conda-forge ambertools  # provides tleap, antechamber

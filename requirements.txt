@@ -1,16 +1,13 @@
-# Core dependencies
+# Core dependencies (all features included)
 numpy>=1.21
 scipy>=1.7
 parmed>=4.0
+openff-toolkit>=0.14
+openff-recharge>=0.3
+openff-interchange>=0.5
+pdbfixer>=1.9
+propka3>=3.4
+rdkit>=2023.03
 
 # Optional: trajectory formats (XTC/TRR)
-mdanalysis>=2.0; extra == "xtc"
-
-# Optional: docking rescoring engine
-# Install with: pip install "easy-mmgbsa[docking]"
-# openff-toolkit>=0.14
-# openff-recharge>=0.3
-# openff-interchange>=0.5
-# pdbfixer>=1.9
-# propka3>=3.4
-# rdkit>=2023.03
+mdanalysis>=2.0

@@ -55,9 +55,6 @@ python3 mmgbsa.py -p topol.top -l lig.itp -c frame_*.gro \
 ### 4. **Docking Rescoring (NEW)** — use `mmgbsa_docking.py`
 
 ```bash
-# Install docking dependencies first:
-# pip install "easy-mmgbsa[docking]"
-
 # Basic: protein PDB + ligand SDF/MOL2/PDB files (or directory)
 python3 mmgbsa_docking.py -p protein.pdb -l ligands.sdf -o results.csv
 
@@ -324,8 +321,23 @@ See [`examples/docking_rescoring_example.md`](examples/docking_rescoring_example
 
 - Python 3.9+
 - NumPy, SciPy
-- ParmEd (`pip install parmed`)
-- MDAnalysis (optional, for XTC/TRR in `mmgbsa_amb.py`)
+- ParmEd
+- OpenFF Toolkit, OpenFF Recharge, OpenFF Interchange (for ligand parameterization)
+- PDBFixer (for protein structure fixing)
+- PROPKA3 (for protein protonation states)
+- RDKit (for chemistry handling)
+
+All Python dependencies are installed automatically with:
+
+```bash
+pip install easy-mmgbsa
+```
+
+External system dependencies (not installable via pip):
+- **AmberTools** (`tleap`, `antechamber`) — required for protein force field assignment and AM1-BCC charge fallback. Install via: `conda install -c conda-forge ambertools`
+- **GROMACS** (`gmx`) — required for GROMACS topology workflows (`mmgbsa_gmx.py`, `mmgbsa.py`)
+
+The package will check for these at runtime and provide clear error messages if missing.
 
 ---
 
